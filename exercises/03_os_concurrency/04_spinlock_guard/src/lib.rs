@@ -24,6 +24,7 @@ unsafe impl<T: Send> Send for SpinLock<T> {}
 /// Spin lock guard: RAII handle holding the lock.
 /// Automatically releases the lock when SpinGuard is dropped.
 pub struct SpinGuard<'a, T> {
+    marker: core::marker::PhantomData<&'a mut T>,
     lock: &'a SpinLock<T>,
 }
 
@@ -41,7 +42,17 @@ impl<T> SpinLock<T> {
     pub fn lock(&self) -> SpinGuard<'_, T> {
         // TODO: Spin-wait to acquire lock
         // TODO: Return SpinGuard { lock: self }
-        todo!()
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        SpinGuard {
+            lock: self,
+            marker: core::marker::PhantomData,
+        }
     }
 }
 
@@ -51,7 +62,7 @@ impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -59,7 +70,7 @@ impl<T> Deref for SpinGuard<'_, T> {
 // Return &mut T
 impl<T> DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -67,7 +78,7 @@ impl<T> DerefMut for SpinGuard<'_, T> {
 // Set lock.locked to false (Release ordering)
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock.locked.store(false, Ordering::Release);
     }
 }
 

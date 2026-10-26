@@ -46,6 +46,7 @@ struct FreeBlock {
 }
 
 pub struct FreeListAllocator {
+    list_locked: core::sync::atomic::AtomicBool,
     heap_start: usize,
     heap_end: usize,
     /// Bump pointer: unallocated region starts here
@@ -66,11 +67,30 @@ unsafe impl Send for FreeListAllocator {}
 #[cfg(not(test))]
 unsafe impl Sync for FreeListAllocator {}
 
+struct ListGuard<'a>(&'a core::sync::atomic::AtomicBool);
+impl Drop for ListGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
 impl FreeListAllocator {
+    fn lock_list(&self) -> ListGuard<'_> {
+        use core::sync::atomic::Ordering;
+        while self
+            .list_locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        ListGuard(&self.list_locked)
+    }
+
     /// # Safety
     /// `heap_start..heap_end` must be a valid readable and writable memory region.
     pub unsafe fn new(heap_start: usize, heap_end: usize) -> Self {
         Self {
+            list_locked: core::sync::atomic::AtomicBool::new(false),
             heap_start,
             heap_end,
             bump_next: core::sync::atomic::AtomicUsize::new(heap_start),
@@ -119,7 +139,55 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         // TODO: Step 2 — no suitable block in free_list, allocate from bump region
         //
         // Same logic as 02_bump_allocator's alloc
-        todo!()
+        let _guard = self.lock_list();
+        // 分配区按块头对齐，释放时可原地存放链表节点。
+        let header_align = core::mem::align_of::<FreeBlock>();
+        let Some(size) = size
+            .checked_add(header_align - 1)
+            .map(|n| n & !(header_align - 1))
+        else {
+            return null_mut();
+        };
+        let mut prev: *mut FreeBlock = null_mut();
+        let mut current = self.free_list_head();
+        unsafe {
+            while !current.is_null() {
+                if current as usize % align == 0 && (*current).size >= size {
+                    let remaining = (*current).size - size;
+                    let next = if remaining >= core::mem::size_of::<FreeBlock>() {
+                        let tail = (current as *mut u8).add(size) as *mut FreeBlock;
+                        tail.write(FreeBlock {
+                            size: remaining,
+                            next: (*current).next,
+                        });
+                        tail
+                    } else {
+                        (*current).next
+                    };
+                    if prev.is_null() {
+                        self.set_free_list_head(next);
+                    } else {
+                        (*prev).next = next;
+                    }
+                    return current as *mut u8;
+                }
+                prev = current;
+                current = (*current).next;
+            }
+        }
+        use core::sync::atomic::Ordering;
+        let next = self.bump_next.load(Ordering::Relaxed);
+        let Some(aligned) = next.checked_add(align - 1).map(|n| n & !(align - 1)) else {
+            return null_mut();
+        };
+        let Some(end) = aligned.checked_add(size) else {
+            return null_mut();
+        };
+        if end > self.heap_end {
+            return null_mut();
+        }
+        self.bump_next.store(end, Ordering::Relaxed);
+        aligned as *mut u8
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -131,7 +199,17 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         // 1. Cast ptr to *mut FreeBlock
         // 2. Write FreeBlock { size, next: current list head }
         // 3. Update free_list head to ptr
-        todo!()
+        let _guard = self.lock_list();
+        let align = core::mem::align_of::<FreeBlock>();
+        let size = (size + align - 1) & !(align - 1);
+        let block = ptr as *mut FreeBlock;
+        unsafe {
+            block.write(FreeBlock {
+                size,
+                next: self.free_list_head(),
+            });
+        }
+        self.set_free_list_head(block);
     }
 }
 
